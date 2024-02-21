@@ -40,7 +40,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		return
 	}
 	for {
-		mapSource, reduceSource, isDone := callGetJob()
+		mapSource, reduceSource := callGetJob()
 		if mapSource != nil {
 			err = WorkerMap(mapSource, mapf)
 			if err != nil {
@@ -51,10 +51,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			if err != nil {
 				log.Println(err)
 			}
-		} else if isDone {
-			err = os.RemoveAll(WorkerTmpDir)
-			log.Println(err)
-			return
 		} else {
 			time.Sleep(time.Second)
 		}
@@ -151,14 +147,14 @@ func callSubmitReduce(hashKey int, filePath string) error {
 	return fmt.Errorf("%w, fun: %s", rpcCallFailed, RPCFunSubmitReduceJob)
 }
 
-func callGetJob() (mapSource *MapSource, reduceSource *ReduceSource, isDone bool) {
+func callGetJob() (mapSource *MapSource, reduceSource *ReduceSource) {
 	var res GetJobReply
 	ok := call(RPCFunGetJob, struct{}{}, &res)
 	if ok {
-		return res.MapSource, res.ReduceSource, res.isDone
+		return res.MapSource, res.ReduceSource
 	}
 
-	return nil, nil, false
+	return nil, nil
 }
 
 // example function to show how to make an RPC call to the coordinator.

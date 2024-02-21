@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -13,16 +14,18 @@ import "net/http"
 
 type Coordinator struct {
 	// Your definitions here.
-
-	mapSourceChan          chan *MapSource
-	reduceSourceChan       chan *ReduceSource
-	done                   chan struct{}
-	submitLock             sync.RWMutex
-	hashKeyFiles           [][]string
-	finishedMapJob         []bool
-	finishedMapJobCount    int
-	finishedReduceJob      []bool
-	finishedReduceJobCount int
+	mapSourceProgressChan    chan *mapSourceProgress
+	reduceSourceProgressChan chan *reduceSourceProgress
+	backupTasksDone          chan struct{}
+	mapSourceChan            chan *MapSource
+	reduceSourceChan         chan *ReduceSource
+	done                     chan struct{}
+	submitLock               sync.RWMutex
+	hashKeyFiles             [][]string
+	finishedMapJob           []bool
+	finishedMapJobCount      int
+	finishedReduceJob        []bool
+	finishedReduceJobCount   int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -46,10 +49,9 @@ func (c *Coordinator) RPCSubmitReduce(args *SubmitReduceArgs, reply *SubmitReduc
 }
 
 func (c *Coordinator) RPCGetJob(_ struct{}, reply *GetJobReply) error {
-	mapSource, reduceSource, isDone := c.getJob()
+	mapSource, reduceSource := c.getJob()
 	reply.MapSource = mapSource
 	reply.ReduceSource = reduceSource
-	reply.isDone = isDone
 	return nil
 }
 
@@ -101,7 +103,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			NReduce:   nReduce,
 		}
 	}
-
+	c.backupTasksDone = make(chan struct{})
+	c.mapSourceProgressChan = make(chan *mapSourceProgress, len(files))
+	c.reduceSourceProgressChan = make(chan *reduceSourceProgress, nReduce)
+	go c.backupTasks()
 	c.server()
 	return &c
 }
@@ -116,12 +121,21 @@ type MapSource struct {
 	FilePaths []string
 	NReduce   int
 }
+type mapSourceProgress struct {
+	*MapSource
+	StartTime time.Time
+}
 type ReduceSource struct {
 	HashKey   int
 	FilePaths []string
 }
+type reduceSourceProgress struct {
+	*ReduceSource
+	StartTime time.Time
+}
 
 func (c *Coordinator) submitMap(id int, hashKeyFile []string) error {
+	log.Println("map", id, hashKeyFile)
 	c.submitLock.Lock()
 	defer c.submitLock.Unlock()
 	if c.finishedMapJob[id] {
@@ -137,7 +151,6 @@ func (c *Coordinator) submitMap(id int, hashKeyFile []string) error {
 	c.finishedMapJobCount++
 	if len(c.finishedMapJob) == c.finishedMapJobCount {
 		go func() {
-			close(c.mapSourceChan)
 			log.Println("map ok")
 			for id, strings := range c.hashKeyFiles {
 				c.reduceSourceChan <- &ReduceSource{
@@ -164,8 +177,8 @@ func (c *Coordinator) submitReduce(hashKey int, filePath string) error {
 	c.finishedReduceJob[hashKey] = true
 	c.finishedReduceJobCount++
 	if len(c.finishedReduceJob) == c.finishedReduceJobCount {
-		close(c.reduceSourceChan)
 		go func() {
+			c.backupTasksDone <- struct{}{}
 			log.Println("reduce ok")
 			c.done <- struct{}{}
 		}()
@@ -173,21 +186,59 @@ func (c *Coordinator) submitReduce(hashKey int, filePath string) error {
 	return nil
 }
 
-func (c *Coordinator) getJob() (mapSource *MapSource, reduceSource *ReduceSource, isDone bool) {
+func (c *Coordinator) getJob() (mapSource *MapSource, reduceSource *ReduceSource) {
 	select {
-	case mapSource, ok := <-c.mapSourceChan:
-		if ok {
-			return mapSource, nil, false
+	case mapSource := <-c.mapSourceChan:
+		c.submitLock.RLock()
+		if c.finishedMapJob[mapSource.ID] {
+			c.submitLock.RUnlock()
+			return c.getJob()
 		}
-	case reduceSource, ok := <-c.reduceSourceChan:
-		if ok {
-			return nil, reduceSource, false
-		} else {
-			return nil, nil, true
+		c.submitLock.RUnlock()
+		c.mapSourceProgressChan <- &mapSourceProgress{
+			MapSource: mapSource,
+			StartTime: time.Now(),
 		}
+		return mapSource, nil
+	case reduceSource := <-c.reduceSourceChan:
+		c.submitLock.RLock()
+		if c.finishedReduceJob[reduceSource.HashKey] {
+			c.submitLock.RUnlock()
+			return c.getJob()
+		}
+		c.submitLock.RUnlock()
+		c.reduceSourceProgressChan <- &reduceSourceProgress{
+			ReduceSource: reduceSource,
+			StartTime:    time.Now(),
+		}
+		return nil, reduceSource
 	default:
+		return nil, nil
 	}
-	return nil, nil, false
+}
+
+func (c *Coordinator) backupTasks() {
+	for {
+		currentTime := time.Now()
+		select {
+		case v := <-c.mapSourceProgressChan:
+			runTime := v.StartTime.Add(10 * time.Second)
+			if currentTime.Before(runTime) {
+				time.Sleep(runTime.Sub(currentTime))
+			}
+			log.Printf("backup map task: %d", v.ID)
+			c.mapSourceChan <- v.MapSource
+		case v := <-c.reduceSourceProgressChan:
+			runTime := v.StartTime.Add(10 * time.Second)
+			if currentTime.Before(runTime) {
+				time.Sleep(runTime.Sub(currentTime))
+			}
+			log.Printf("backup reduce task: %d", v.HashKey)
+			c.reduceSourceChan <- v.ReduceSource
+		case <-c.backupTasksDone:
+			return
+		}
+	}
 }
 
 // 平均分配数组元素到指定数量的切片

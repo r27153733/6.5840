@@ -41,7 +41,6 @@ type SubmitReduceReply struct {
 type GetJobReply struct {
 	MapSource    *MapSource
 	ReduceSource *ReduceSource
-	isDone       bool
 }
 
 const (
