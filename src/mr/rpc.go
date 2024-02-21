@@ -24,6 +24,31 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type SubmitMapArgs struct {
+	ID          int
+	HashKeyFile []string
+}
+type SubmitMapReply struct {
+	Err error
+}
+type SubmitReduceArgs struct {
+	HashKey  int
+	FilePath string
+}
+type SubmitReduceReply struct {
+	Err error
+}
+type GetJobReply struct {
+	MapSource    *MapSource
+	ReduceSource *ReduceSource
+	isDone       bool
+}
+
+const (
+	RPCFunSubmitMapJob    = "Coordinator.RPCSubmitMap"
+	RPCFunSubmitReduceJob = "Coordinator.RPCSubmitReduce"
+	RPCFunGetJob          = "Coordinator.RPCGetJob"
+)
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
