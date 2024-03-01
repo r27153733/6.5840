@@ -10,3 +10,8 @@ func DPrintf(format string, a ...interface{}) {
 		log.Printf(format, a...)
 	}
 }
+func DPrintln(a ...interface{}) {
+	if Debug {
+		log.Println(a...)
+	}
+}
