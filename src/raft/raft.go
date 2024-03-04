@@ -167,6 +167,7 @@ func (rf *Raft) doCandidate(ctx context.Context, term int) {
 	DPrintln("doCandidate: ", rf.me, term)
 	//DPrintln(rf.me, "heartbeatTimeOut", time.Since(rf.lastHeartbeatTime))
 	timeoutChan := time.After(time.Duration(rand.Int64N(int64(electionTimeoutMax-electionTimeoutMin))) + electionTimeoutMin)
+	rf.mu.Lock()
 	idx := len(rf.logs) - 1
 	req := RequestVoteArgs{
 		Term:         term,
@@ -174,6 +175,7 @@ func (rf *Raft) doCandidate(ctx context.Context, term int) {
 		LastLogIndex: idx,
 		LastLogTerm:  rf.logs[idx].Term,
 	}
+	rf.mu.Unlock()
 	peerSize := len(rf.peers)
 	voteChan := make(chan bool, peerSize)
 	childCtx, cancelFunc := context.WithCancel(ctx)
