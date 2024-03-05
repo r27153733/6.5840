@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	electionTimeoutMin = 500 * time.Millisecond
-	electionTimeoutMax = 1000 * time.Millisecond
+	electionTimeoutMin = 200 * time.Millisecond
+	electionTimeoutMax = 350 * time.Millisecond
 	heartbeatTime      = 100 * time.Millisecond
 )
 
@@ -81,6 +81,10 @@ type Raft struct {
 	//higherTermChan          chan int
 	//electionSuccessTermChan chan int
 	appendEntriesChan chan struct{}
+	//applyCommandChan  chan []*ApplyMsg
+	applyCommandCond  *sync.Cond
+	ctx               context.Context
+	cancelFunc        context.CancelFunc
 	loopCtx           context.Context
 	cancelLoopFunc    context.CancelFunc
 	runningTerm       int
@@ -88,8 +92,9 @@ type Raft struct {
 	votedFor          int       // 在当前任期内收到选票的 Candidate id（如果没有就为 -1）
 	currentLogsLen    int       // 在当前任期内合法的日志
 	logs              []*Logger // 日志条目；每个条目包含状态机的要执行命令和从 Leader 处收到时的任期号
-	commitIndex       int       // 已知的被提交的最大日志条目的索引值（从0开始递增）
-	lastApplied       int       // 被状态机执行的最大日志条目的索引值（从0开始递增）
+	snapshot          Snapshot
+	commitIndex       int // 已知的被提交的最大日志条目的索引值（从0开始递增）
+	lastApplied       int // 被状态机执行的最大日志条目的索引值（从0开始递增）
 	lastHeartbeatTime time.Time
 	//nextIndex         []int // 对于每一个服务器，记录需要发给它的下一个日志条目的索引（初始化为最后一个日志条目的 index 加1）
 	//matchIndex        []int // 对于每一个服务器，记录已经复制到该服务器的日志的最高索引值（从0开始递增）
@@ -110,9 +115,9 @@ func (rf *Raft) switchLeader() {
 	rf.role = roleLeader
 	// do Leader
 	rf.cancelLoopFunc()
-	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(context.Background())
+	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(rf.ctx)
 	rf.runningTerm = rf.currentTerm
-	go rf.doLeader(rf.loopCtx, rf.currentTerm, len(rf.logs))
+	go rf.doLeader(rf.loopCtx, rf.currentTerm, rf.logLen())
 
 }
 
@@ -120,14 +125,20 @@ func (rf *Raft) switchCandidate() {
 	rf.role = roleCandidate
 	// do Candidate
 	rf.cancelLoopFunc()
-	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(context.Background())
+	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(rf.ctx)
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.currentLogsLen = -1
 	rf.persist()
 	rf.runningTerm = rf.currentTerm
 	rf.lastHeartbeatTime = time.Now()
-	go rf.doCandidate(rf.loopCtx, rf.currentTerm)
+	lastLogIdx := rf.logLen() - 1
+
+	if lastLog, ok := rf.getLog(lastLogIdx); ok {
+		go rf.doCandidate(rf.loopCtx, rf.currentTerm, lastLogIdx, lastLog.Term)
+	} else {
+		go rf.doCandidate(rf.loopCtx, rf.currentTerm, lastLogIdx, rf.snapshot.LastIncludedTerm)
+	}
 }
 
 func (rf *Raft) switchFollower() {
@@ -135,7 +146,7 @@ func (rf *Raft) switchFollower() {
 		rf.role = roleFollower
 		// do Follower
 		rf.cancelLoopFunc()
-		rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(context.Background())
+		rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(rf.ctx)
 		go rf.doFollower(rf.loopCtx)
 	}
 }
@@ -146,7 +157,7 @@ func (rf *Raft) doFollower(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Duration(rand.Int64N(int64(electionTimeoutMax-electionTimeoutMin))) + electionTimeoutMin):
+		case <-time.After(time.Duration(50+rand.Int64N(150)) * time.Millisecond):
 
 			rf.mu.Lock()
 			rf.muS = "doFollower"
@@ -163,19 +174,16 @@ func (rf *Raft) doFollower(ctx context.Context) {
 		}
 	}
 }
-func (rf *Raft) doCandidate(ctx context.Context, term int) {
+func (rf *Raft) doCandidate(ctx context.Context, term, lastLogIdx, lastLogTerm int) {
 	DPrintln("doCandidate: ", rf.me, term)
 	//DPrintln(rf.me, "heartbeatTimeOut", time.Since(rf.lastHeartbeatTime))
 	timeoutChan := time.After(time.Duration(rand.Int64N(int64(electionTimeoutMax-electionTimeoutMin))) + electionTimeoutMin)
-	rf.mu.Lock()
-	idx := len(rf.logs) - 1
 	req := RequestVoteArgs{
 		Term:         term,
 		CandidateId:  rf.me,
-		LastLogIndex: idx,
-		LastLogTerm:  rf.logs[idx].Term,
+		LastLogIndex: lastLogIdx,
+		LastLogTerm:  lastLogTerm,
 	}
-	rf.mu.Unlock()
 	peerSize := len(rf.peers)
 	voteChan := make(chan bool, peerSize)
 	childCtx, cancelFunc := context.WithCancel(ctx)
@@ -199,6 +207,7 @@ func (rf *Raft) doCandidate(ctx context.Context, term int) {
 		case <-timeoutChan:
 			DPrintln(rf.me, "timeoutC")
 			rf.mu.Lock()
+			rf.muS = "doCandidate 1"
 			rf.switchCandidate()
 			rf.mu.Unlock()
 			return
@@ -211,12 +220,14 @@ func (rf *Raft) doCandidate(ctx context.Context, term int) {
 			DPrintln(rf.me, voteCnt, disVoteCnt)
 			if voteCnt*2 > peerSize {
 				rf.mu.Lock()
+				rf.muS = "doCandidate 2"
 				rf.switchLeader()
 				rf.mu.Unlock()
 				return
 			}
 			if disVoteCnt*2 > peerSize {
 				rf.mu.Lock()
+				rf.muS = "doCandidate 3"
 				rf.switchFollower()
 				rf.mu.Unlock()
 				return
@@ -235,6 +246,7 @@ func (rf *Raft) sendRequestVoteOk(ctx context.Context, peer *labrpc.ClientEnd, r
 			ok := sendRequestVote(peer, req, &resp)
 			if ok {
 				rf.mu.Lock()
+				rf.muS = "sendRequestVoteOk"
 				rf.tryUpdateTerm(resp.Term)
 				rf.mu.Unlock()
 				voteChan <- resp.VoteGranted
@@ -252,7 +264,7 @@ func (rf *Raft) doLeader(ctx context.Context, term, nextLogIndex int) {
 	for i := 0; i < len(rf.peers); i++ {
 		nextIndex[i] = nextLogIndex
 	}
-
+	rf.allSendAppendEntries(term, nextIndex, matchIndex)
 	for {
 		select {
 		case <-ctx.Done():
@@ -268,21 +280,47 @@ func (rf *Raft) doLeader(ctx context.Context, term, nextLogIndex int) {
 
 func (rf *Raft) allSendAppendEntries(term int, nextIndex, matchIndex []int) {
 	rf.mu.Lock()
-	reqs := make([]AppendEntriesArgs, len(rf.peers))
-	commitLogIndex := len(rf.logs) - 1
-	if rf.role != roleLeader || rf.currentTerm != term || (rf.logs[commitLogIndex].Term != term && rf.logs[commitLogIndex].Term != 0) {
+	rf.muS = "allSendAppendEntries"
+	commitLogIndex := rf.logLen() - 1
+	var commitLogTerm int
+	if commitLog, ok := rf.getLog(commitLogIndex); ok {
+		commitLogTerm = commitLog.Term
+	} else {
+		commitLogTerm = rf.snapshot.LastIncludedTerm
+	}
+	if rf.role != roleLeader || rf.currentTerm != term || (commitLogTerm != term && commitLogTerm != 0) {
 		rf.mu.Unlock()
 		return
 	}
 	existLogPeerCnt := 1
+	appendEntriesReqs := make([]*AppendEntriesArgs, len(rf.peers))
+	//installSnapshotReqs := make([]*InstallSnapshotArgs, len(rf.peers))
+	installSnapshotReq := InstallSnapshotArgs{
+		Term:     term,
+		LeaderId: rf.me,
+		Snapshot: rf.snapshot,
+	}
 	for i := 0; i < len(rf.peers); i++ {
-		entries := make([]*Logger, len(rf.logs)-nextIndex[i])
-		copy(entries, rf.logs[nextIndex[i]:])
-		reqs[i] = AppendEntriesArgs{
+		if rf.logLen()-nextIndex[i] < 0 || rf.me == i {
+			continue
+		}
+		entries := make([]*Logger, rf.logLen()-nextIndex[i])
+		splitLog, ok := rf.splitLog(nextIndex[i])
+		if !ok {
+			continue
+		}
+		copy(entries, splitLog)
+		var prevLogTerm int
+		if log, ok := rf.getLog(nextIndex[i] - 1); ok {
+			prevLogTerm = log.Term
+		} else {
+			prevLogTerm = rf.snapshot.LastIncludedTerm
+		}
+		appendEntriesReqs[i] = &AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: nextIndex[i] - 1,
-			PrevLogTerm:  rf.logs[nextIndex[i]-1].Term,
+			PrevLogTerm:  prevLogTerm,
 			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
@@ -295,42 +333,46 @@ func (rf *Raft) allSendAppendEntries(term int, nextIndex, matchIndex []int) {
 		peer := peer
 		i := i
 		go func() {
+			if appendEntriesReqs[i] == nil {
+				resp := InstallSnapshotReply{}
+				ok := sendInstallSnapshot(peer, &installSnapshotReq, &resp)
+				if ok {
+					rf.tryUpdateTerm(resp.Term)
+				}
+				return
+			}
 			resp := AppendEntriesReply{}
 			//DPrintln(rf.me, "send", i)
-			ok := sendAppendEntries(peer, &reqs[i], &resp)
+			ok := sendAppendEntries(peer, appendEntriesReqs[i], &resp)
 			//DPrintln(ok, rf.me, i)
 			if ok {
 				rf.mu.Lock()
+				rf.muS = "allSendAppendEntries fun1"
 				rf.tryUpdateTerm(resp.Term)
-				if rf.role != roleLeader || rf.currentTerm != term || (rf.logs[commitLogIndex].Term != term && rf.logs[commitLogIndex].Term != 0) {
+				if rf.role != roleLeader || rf.currentTerm != term {
 					rf.mu.Unlock()
 					return
 				}
 				if resp.Success {
-					if nextIndex[i] < len(rf.logs) {
-						nextIndex[i] = max(nextIndex[i], reqs[i].PrevLogIndex+2)
+					if nextIndex[i] < rf.logLen() {
+						nextIndex[i] = max(nextIndex[i], appendEntriesReqs[i].PrevLogIndex+2)
 					}
 					matchIndex[i] = max(matchIndex[i], commitLogIndex)
 					existLogPeerCnt++
-					//if len(reqs[i].Entries) != 0 {
+					//if len(appendEntriesReqs[i].Entries) != 0 {
 					//	log.Println(i, "ok commit", commitLogIndex, nextIndex, matchIndex)
 					//}
 					if existLogPeerCnt*2 > len(rf.peers) && rf.commitIndex < commitLogIndex {
 						//log.Println(rf.me, "leader add commit", commitLogIndex, matchIndex)
 						rf.commitIndex = commitLogIndex
-						rf.appliedLog()
+						rf.applyLogS()
 					}
 				} else {
 					nextIndexPeer := -1
 					if resp.XTerm != -1 {
-						for i := len(rf.logs) - 1; i > 0; i-- {
-							if rf.logs[i].Term == resp.XTerm {
-								nextIndexPeer = i
-								break
-							}
-						}
+						nextIndexPeer = rf.findTermLogLastIndex(resp.XTerm)
 						if nextIndexPeer == -1 {
-							nextIndexPeer = min(resp.XIndex, max(reqs[i].PrevLogIndex, 1))
+							nextIndexPeer = min(resp.XIndex, max(appendEntriesReqs[i].PrevLogIndex, 1))
 						}
 
 					} else {
@@ -346,20 +388,65 @@ func (rf *Raft) allSendAppendEntries(term int, nextIndex, matchIndex []int) {
 		}()
 	}
 }
-
-func (rf *Raft) appliedLog() {
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{
-			CommandValid:  true,
-			Command:       rf.logs[i].Command,
-			CommandIndex:  i,
-			SnapshotValid: false,
-			Snapshot:      nil,
-			SnapshotTerm:  0,
-			SnapshotIndex: 0,
+func (rf *Raft) applyLogS() {
+	rf.applyCommandCond.Signal()
+	//applyMsgs := make([]*ApplyMsg, 0)
+	//for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+	//	getLog, _ := rf.getLog(i)
+	//	applyMsgs = append(applyMsgs, &ApplyMsg{
+	//		CommandValid:  true,
+	//		Command:       getLog.Command,
+	//		CommandIndex:  i,
+	//		SnapshotValid: false,
+	//		Snapshot:      nil,
+	//		SnapshotTerm:  0,
+	//		SnapshotIndex: 0,
+	//	})
+	//	//if applyMsgs[len(applyMsgs)-1].Command == nil {
+	//	//	panic(applyMsgs)
+	//	//}
+	//}
+	//rf.lastApplied = rf.commitIndex
+	////log.Println("send msgS", applyMsgs)
+	//go func() { rf.applyCommandChan <- applyMsgs }()
+}
+func (rf *Raft) handleApplyLog() {
+	for {
+		rf.mu.Lock()
+		rf.applyCommandCond.Wait()
+		rf.muS = "handleApplyLog wait"
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		applyMsgs := make([]*ApplyMsg, 0)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			getLog, _ := rf.getLog(i)
+			if i == 0 {
+				panic(getLog)
+			}
+			applyMsgs = append(applyMsgs, &ApplyMsg{
+				CommandValid:  true,
+				Command:       getLog.Command,
+				CommandIndex:  i,
+				SnapshotValid: false,
+				Snapshot:      nil,
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			})
+			//if applyMsgs[len(applyMsgs)-1].Command == nil {
+			//	panic(applyMsgs)
+			//}
+		}
+		rf.lastApplied = rf.commitIndex
+		rf.mu.Unlock()
+		for _, msg := range applyMsgs {
+			if msg.CommandIndex == 0 {
+				panic(msg)
+			}
+			rf.applyCh <- *msg
 		}
 	}
-	rf.lastApplied = rf.commitIndex
 }
 
 // return currentTerm and whether this server
@@ -405,8 +492,16 @@ func (rf *Raft) persist() {
 	if err != nil {
 		panic(err)
 	}
+	err = e.Encode(rf.snapshot.LastIncludedIndex)
+	if err != nil {
+		panic(err)
+	}
+	err = e.Encode(rf.snapshot.LastIncludedTerm)
+	if err != nil {
+		panic(err)
+	}
 	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(raftState, rf.snapshot.Data)
 }
 
 // restore previously persisted state.
@@ -430,6 +525,12 @@ func (rf *Raft) readPersist(data []byte) bool {
 	if err := d.Decode(&rf.logs); err != nil {
 		panic(err)
 	}
+	if err := d.Decode(&rf.snapshot.LastIncludedIndex); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.snapshot.LastIncludedTerm); err != nil {
+		panic(err)
+	}
 	DPrintln(rf.me, true, rf.currentTerm, rf.votedFor, rf.logs)
 	return true
 }
@@ -440,7 +541,38 @@ func (rf *Raft) readPersist(data []byte) bool {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.muS = "Snapshot"
+	if rf.snapshot.LastIncludedIndex == index {
+		return
+	}
+	logger, _ := rf.getLog(index)
+	rf.saveSnapshot(index, logger.Term, snapshot)
+}
 
+func (rf *Raft) saveSnapshot(index, term int, snapshot []byte) {
+
+	var newLog []*Logger
+	if index+1 < rf.logLen() {
+		logs, ok := rf.splitLog(index + 1)
+		if !ok {
+			return
+		}
+		newLog = make([]*Logger, len(logs))
+		copy(newLog, logs)
+	} else {
+		newLog = make([]*Logger, 0)
+	}
+
+	//if newLog[0].Command == nil {
+	//	panic(newLog)
+	//}
+	rf.logs = newLog
+	rf.snapshot.Data = snapshot
+	rf.snapshot.LastIncludedIndex = index
+	rf.snapshot.LastIncludedTerm = term
+	rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -471,9 +603,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.tryUpdateTerm(args.Term)
 	reply.Term = rf.currentTerm
 
+	var lastLogTerm int
+	if log, ok := rf.getLog(rf.logLen() - 1); ok {
+		lastLogTerm = log.Term
+	} else {
+		lastLogTerm = rf.snapshot.LastIncludedTerm
+	}
+
 	reply.VoteGranted = args.Term >= rf.currentTerm &&
 		(rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-		(rf.logs[len(rf.logs)-1].Term < args.LastLogTerm || (rf.logs[len(rf.logs)-1].Term == args.LastLogTerm && args.LastLogIndex >= len(rf.logs)-1))
+		(lastLogTerm < args.LastLogTerm || (lastLogTerm == args.LastLogTerm && args.LastLogIndex >= rf.logLen()-1))
 
 	DPrintln("RequestVote", rf.me, *args, *reply, rf.currentTerm, rf.votedFor)
 	if reply.VoteGranted {
@@ -546,49 +685,53 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.tryUpdateTerm(args.Term)
 	reply.Term = rf.currentTerm
-	lenOk := len(rf.logs) > args.PrevLogIndex
+	lenOk := rf.logLen() > args.PrevLogIndex
+
+	prevLogIndexTerm := -1
+	if lenOk {
+		if log, ok := rf.getLog(args.PrevLogIndex); ok {
+			prevLogIndexTerm = log.Term
+		} else if args.PrevLogIndex == rf.snapshot.LastIncludedIndex {
+			prevLogIndexTerm = rf.snapshot.LastIncludedTerm
+		}
+	}
 	reply.Success = args.Term >= rf.currentTerm &&
-		lenOk && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm
+		lenOk && prevLogIndexTerm == args.PrevLogTerm
 
 	if reply.Success {
-		if args.PrevLogIndex+1+len(args.Entries) > rf.currentLogsLen {
-			rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-			rf.currentLogsLen = len(rf.logs)
-		}
-
-		rf.persist()
+		//if args.PrevLogIndex+1+len(args.Entries) > rf.currentLogsLen {
+		//	rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+		//	rf.currentLogsLen = len(rf.logs)
+		//}
+		//rf.persist()
+		rf.mergeLog(args.PrevLogIndex, args.Entries)
 		if args.LeaderCommit > rf.commitIndex {
 			//if rf.commitIndex > min(args.LeaderCommit, len(rf.logs)) {
 			//	log.Println(rf.me, rf.role, "add commit error for", args.LeaderId, args.Term, args.PrevLogIndex, *reply, rf.commitIndex, min(args.LeaderCommit, len(rf.logs)))
 			//} else if rf.commitIndex < min(args.LeaderCommit, len(rf.logs)) {
 			//	log.Println(rf.me, rf.role, "add commit for", args.LeaderId, args.Term, args.PrevLogIndex, *reply, rf.commitIndex, min(args.LeaderCommit, len(rf.logs)))
 			//}
-			rf.commitIndex = min(max(args.LeaderCommit, rf.commitIndex), len(rf.logs))
-			rf.appliedLog()
+			rf.commitIndex = min(max(args.LeaderCommit, rf.commitIndex), rf.logLen())
+			rf.applyLogS()
 		}
 	} else {
-		reply.XLen = len(rf.logs)
-		if lenOk {
-			reply.XTerm = rf.logs[args.PrevLogIndex].Term
-			for i := 1; i < len(rf.logs); i++ {
-				if rf.logs[i].Term == reply.XTerm {
-					reply.XIndex = i
-					break
-				}
-			}
+		reply.XLen = rf.logLen()
+		if lenOk && prevLogIndexTerm != -1 {
+			reply.XTerm = prevLogIndexTerm
+			reply.XIndex = rf.findTermLogFirstIndex(prevLogIndexTerm)
 		} else {
 			reply.XTerm = -1
 			reply.XIndex = -1
 		}
 
 	}
-	//if rf.me == 0 {
-	//	es := make([]Logger, len(args.Entries))
-	//	for i, entry := range args.Entries {
-	//		es[i] = *entry
-	//	}
-	//	log.Println("AppendEntries", rf.me, *args, *reply, rf.commitIndex, es)
-	//}
+	if rf.me == 0 {
+		es := make([]Logger, len(args.Entries))
+		for i, entry := range args.Entries {
+			es[i] = *entry
+		}
+		//log.Println("AppendEntries", rf.me, *args, *reply, rf.commitIndex, es)
+	}
 	//DPrintln("AppendEntries", rf.me, *args, *reply, rf.commitIndex)
 }
 
@@ -612,6 +755,7 @@ func sendAppendEntries(peer *labrpc.ClientEnd, args *AppendEntriesArgs, reply *A
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.muS = "Start"
 	if rf.role != roleLeader {
 		return -1, rf.currentTerm, false
 	}
@@ -620,8 +764,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// leader first append log entry to its local log.
 	rf.logs = append(rf.logs, &newLog)
 	rf.persist()
-	curLogIdx := len(rf.logs) - 1
-	go func() { rf.appendEntriesChan <- struct{}{} }()
+	curLogIdx := rf.logLen() - 1
+	select {
+	case rf.appendEntriesChan <- struct{}{}:
+	default:
+	}
 	return curLogIdx, rf.runningTerm, true
 }
 
@@ -637,9 +784,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.mu.Lock()
-	rf.cancelLoopFunc()
-	rf.mu.Unlock()
+	rf.cancelFunc()
+	rf.applyCommandCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -666,6 +812,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
 	rf.appendEntriesChan = make(chan struct{})
+	//rf.applyCommandChan = make(chan []*ApplyMsg)
+	rf.applyCommandCond = sync.NewCond(&rf.mu)
 	// initialize from state persisted before a crash
 	if !rf.readPersist(persister.ReadRaftState()) {
 		rf.votedFor = -1
@@ -673,19 +821,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			Term:    0,
 			Command: nil,
 		}}
+		rf.snapshot = Snapshot{
+			LastIncludedIndex: -1,
+			LastIncludedTerm:  0,
+			Data:              nil,
+		}
+	} else {
+		rf.snapshot.Data = rf.persister.ReadSnapshot()
+		if rf.snapshot.LastIncludedIndex != -1 {
+			rf.lastApplied = rf.snapshot.LastIncludedIndex
+			rf.commitIndex = rf.snapshot.LastIncludedIndex
+		}
 	}
-	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(context.Background())
+	rf.ctx, rf.cancelFunc = context.WithCancel(context.Background())
+	rf.loopCtx, rf.cancelLoopFunc = context.WithCancel(rf.ctx)
+	go rf.handleApplyLog()
 	go rf.doFollower(rf.loopCtx)
 	//go rf.switchRole()
 	//go func() {
 	//	for !rf.killed() {
-	//		time.Sleep(5 * time.Second)
+	//		time.Sleep(10 * time.Second)
 	//		ok := rf.mu.TryLock()
 	//		if ok {
-	//			DPrintln(me, "life", rf.role, ok, rf.muS)
+	//			log.Println(me, "life", rf.role, ok, rf.muS)
 	//			rf.mu.Unlock()
 	//		} else {
-	//			//DPrintln(me, "life", rf.role, ok, rf.muS)
+	//			log.Println(me, "life", rf.role, ok, rf.muS)
 	//		}
 	//	}
 	//}()
@@ -700,4 +861,126 @@ func (rf *Raft) tryUpdateTerm(term int) {
 		rf.switchFollower()
 		rf.persist()
 	}
+}
+
+func (rf *Raft) getLog(index int) (*Logger, bool) {
+	l := index - rf.snapshot.LastIncludedIndex - 1
+	if l < 0 {
+		return nil, false
+	}
+	return rf.logs[l], true
+}
+
+func (rf *Raft) logLen() int {
+	return len(rf.logs) + rf.snapshot.LastIncludedIndex + 1
+}
+
+func (rf *Raft) splitLog(startIndex int) ([]*Logger, bool) {
+	s := startIndex - rf.snapshot.LastIncludedIndex - 1
+	if s < 0 {
+		return nil, false
+	}
+	return rf.logs[s:], true
+}
+
+//	if args.PrevLogIndex+1+len(args.Entries) > rf.currentLogsLen {
+//		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
+//		rf.currentLogsLen = len(rf.logs)
+//	}
+//
+// rf.persist()
+func (rf *Raft) mergeLog(prevLogIndex int, entries []*Logger) {
+	if prevLogIndex+1+len(entries) > rf.currentLogsLen {
+		if rf.me == 0 {
+			es := make([]Logger, len(entries))
+			for i, entry := range entries {
+				es[i] = *entry
+			}
+			DPrintln("merge", rf.me, prevLogIndex+1+len(entries), rf.currentLogsLen, rf.commitIndex, es)
+		}
+		rf.logs = append(rf.logs[:prevLogIndex+1-rf.snapshot.LastIncludedIndex-1], entries...)
+		rf.currentLogsLen = rf.logLen()
+		rf.persist()
+	} else {
+		//log.Println("merge fail", rf.me, prevLogIndex+1+len(entries), rf.currentLogsLen, rf.commitIndex, entries)
+	}
+}
+func (rf *Raft) findTermLogLastIndex(xTerm int) int {
+	for i := len(rf.logs) - 1; i > 0; i-- {
+		if rf.logs[i].Term == xTerm {
+			if rf.snapshot.LastIncludedTerm == xTerm {
+				return rf.snapshot.LastIncludedIndex
+			}
+			return i + rf.snapshot.LastIncludedIndex + 1
+		}
+	}
+	return -1
+}
+func (rf *Raft) findTermLogFirstIndex(xTerm int) int {
+	if rf.snapshot.LastIncludedTerm == xTerm {
+		return rf.snapshot.LastIncludedIndex
+	}
+	for i := 0; i < len(rf.logs); i++ {
+		if rf.logs[i].Term == xTerm {
+			return i + rf.snapshot.LastIncludedIndex + 1
+		}
+	}
+	return -1
+}
+
+type Snapshot struct {
+	LastIncludedIndex int    // 快照中包含的最后日志条目的索引值
+	LastIncludedTerm  int    // 快照中包含的最后日志条目的任期号
+	Data              []byte // 快照块的原始数据
+}
+type InstallSnapshotArgs struct {
+	Term     int // Leader 的任期
+	LeaderId int // 为了 Follower 能重定向到客户端
+	Snapshot
+}
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	rf.muS = "InstallSnapshot"
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+	rf.tryUpdateTerm(args.Term)
+	if rf.snapshot.LastIncludedIndex >= args.LastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+	rf.lastHeartbeatTime = time.Now()
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+	if rf.currentLogsLen < args.LastIncludedIndex {
+		rf.currentLogsLen = args.LastIncludedIndex
+	}
+	rf.saveSnapshot(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
+		rf.mu.Unlock()
+		rf.applyCh <- ApplyMsg{
+			CommandValid:  false,
+			Command:       nil,
+			CommandIndex:  0,
+			SnapshotValid: true,
+			Snapshot:      rf.snapshot.Data,
+			SnapshotTerm:  rf.snapshot.LastIncludedTerm,
+			SnapshotIndex: rf.snapshot.LastIncludedIndex,
+		}
+	} else {
+		rf.mu.Unlock()
+	}
+}
+
+func sendInstallSnapshot(peer *labrpc.ClientEnd, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := peer.Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
